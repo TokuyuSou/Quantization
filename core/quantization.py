@@ -1,144 +1,121 @@
-from typing import Literal, TypedDict
+from typing import Literal
 
 import torch
-from torch.optim import Adam
+import torch.mps
+from torch import Tensor
+
+from core.models.easy_quant import EasyQuantConfig, quantize_tensor_easy_quant
 
 QuantizationAlgorithm = Literal["EasyQuant"]
 
 
-class EasyQuantConfig(TypedDict):
-    learning_rate: float
-    num_epochs: int
-
-
-def _quantize_vector_with_range(
-    x: torch.tensor, q_range: float, num_bits: int, detach: bool = False
-) -> torch.tensor:
-    if detach:
-        return (
-            torch.clamp(
-                torch.round(x / q_range.detach()),
-                min=-(2 ** (num_bits - 1)) + 1,
-                max=2 ** (num_bits - 1),
-            )
-            * q_range.detach()
-        )
-    else:
-        return (
-            torch.clamp(
-                torch.round(x / q_range),
-                min=-(2 ** (num_bits - 1)) + 1,
-                max=2 ** (num_bits - 1),
-            )
-            * q_range
-        )
-
-
-def compute_quantization_error(x: torch.tensor, quantized_x: torch.tensor) -> float:
-    return torch.sum((quantized_x - x) ** 2).item()
-
-
-def quantize_tensor_easy_quant(
-    x: torch.tensor, num_bits: int, config: EasyQuantConfig, verbose: bool = False
-) -> tuple[torch.tensor, list[float], list[float]]:
-    """Quantize a tensor using the EasyQuant algorithm proposed by Tang et al. (2024)
-
+def mask_outliers(tensor: Tensor, n_sigma: int = 3) -> Tensor:
+    """Mask outliers in a tensor based on the specified number of standard deviations
     Args:
-        x (Tensor): input tensor to be quantized
-        num_bits (int): number of bits to quantize the tensor
-        config (dict): configuration parameters for the EasyQuant algorithm
-        verbose (bool): whether to print debug information
+        tensor (Tensor): input tensor
+        n_sigma (int, optional): number of standard deviations to consider as outliers. Defaults to 3.
 
     Returns:
-        Tensor: dequantized (reconstructed) tensor
-        list[float]: history of quantization range values
-        list[float]: history of reconstruction error values
+        Tensor: boolean mask of the same shape as the input tensor (True for outliers, False otherwise)
     """
-
-    ## Optimize the quantization range using gradient descent and Adam optimizer
-    # Extract configuration parameters
-    learning_rate = config["learning_rate"]
-    num_epochs = config["num_epochs"]
-
-    print(f"Optimizing quantization range using EasyQuant algorithm")
-    print(f"Learning rate: {learning_rate}")
-    print(f"Number of epochs: {num_epochs}")
-
-    # Initialize the quantization range to cover the entire range of the input tensor
-    q_range = (
-        ((x.max() - x.min()) / (2**num_bits - 1)).clone().detach().requires_grad_(True)
-    )
-
-    if verbose:
-        print(f"Initial quantization range: {q_range.item()}")
-
-    # track quantization range and reconstruction error
-    q_range_history = []
-    reconstruction_error_history = []
-
-    # Define the optimizer
-    optimizer = Adam([q_range], lr=learning_rate)
-
-    # Optimize the quantization range using gradient descent
-    for epoch in range(num_epochs):
-        optimizer.zero_grad()
-
-        q_range_history.append(q_range.item())
-
-        # Dequantize the input tensor using the current quantization range
-        quantized_x = _quantize_vector_with_range(x, q_range, num_bits)
-
-        # Compute the quantization error
-        reconstruction_error = compute_quantization_error(x, quantized_x)
-        reconstruction_error_history.append(reconstruction_error)
-
-        # Compute explicitly the gradient of the quantization error with respect to the quantization range
-        grad_of_error = (
-            2 * torch.sum((quantized_x - x) * torch.round(x / q_range)).item()
-        )
-
-        q_range.grad = torch.tensor(grad_of_error)
-
-        # Compute the gradient of the quantization error
-        optimizer.step()
-
-        if verbose:
-            print(f"Epoch {epoch + 1}: Quantization range = {q_range.item()}")
-
-        # Ensure q_range remains positive to avoid division by zero
-        with torch.no_grad():
-            q_range.clamp_(min=1e-6)
-
-    # Dequantize the input tensor using the optimized quantization range
-    x_reconstructed = _quantize_vector_with_range(x, q_range, num_bits, detach=True)
-
-    return x_reconstructed, q_range_history, reconstruction_error_history
+    mean = tensor.mean()
+    std = tensor.std()
+    outlier_mask = torch.abs(tensor - mean) >= (n_sigma * std)
+    return outlier_mask
 
 
-def quantize_tensor(
-    x: torch.tensor,
+def quantize_layer(
+    W: Tensor,
     num_bits: int,
     quantization_algorithm: QuantizationAlgorithm,
-    verbose: bool,
+    retain_outliers: bool,
+    outlier_threshold: int = 3,
+    verbose: bool = False,
     **kwargs,
-) -> tuple[torch.tensor, list[float], list[float]]:
+) -> tuple[Tensor, Tensor | None]:
+    """Quantize a layer of a neural network (all weights in the layer)
+
+    Args:
+        W (Tensor): weight tensor to be quantized (2D tensor)
+        num_bits (int): number of bits to quantize the tensor
+        quantization_algorithm (QuantizationAlgorithm): quantization algorithm to use
+        retain_outliers (bool): whether to retain outliers during quantization
+        outlier_threshold (int, optional): threshold for identifying outliers. Defaults to 3.
+        verbose (bool, optional): whether to print debug information. Defaults to False.
+
+    Returns:
+        Tensor: quantized tensor of the normal weights (same shape as the input tensor, with outliers set to zero)
+        Tensor | None: retained outlier weights (same shape as the input tensor, sparse matrix stored in CSR format)
+    """
+    # Check if mps is available
+    device = torch.device("mps" if torch.mps.is_available() else "cpu")
+
+    ## Outlier detection and masking
+    if retain_outliers:
+        if W.dim() != 2:
+            raise ValueError(
+                f"Outlier retention is only supported for 2D tensors (weight matrices): {W.shape}"
+            )
+        # Identify outliers in the input tensor
+        outlier_mask = mask_outliers(W, outlier_threshold)
+
+        # Extract outliers and normal weights
+        outlier_weights = W.clone()
+        outlier_weights[~outlier_mask] = 0
+        normal_weights = W.clone()
+        normal_weights[outlier_mask] = 0
+
+        # Store outlier weights in CSR format for efficient processing
+        outlier_weights = outlier_weights.to_sparse_csr()
+    else:
+        normal_weights = W
+        outlier_weights = None
+
+    # Allocate memory for the quantized weights
+    quantized_normal_weights = torch.empty_like(normal_weights, device=device)
+
+    ## Quantization per channel
+    args = [
+        (
+            normal_weights[i].to(device),
+            num_bits,
+            quantization_algorithm,
+            verbose,
+        )
+        for i in range(W.size(0))
+    ]
+
+    for i in range(W.size(0)):
+        quantized_normal_weights[i] = quantize_single_tensor(*args[i], **kwargs)
+
+    return quantized_normal_weights, outlier_weights
+
+
+def quantize_single_tensor(
+    x: Tensor,
+    num_bits: int,
+    quantization_algorithm: QuantizationAlgorithm,
+    verbose: bool = False,
+    **kwargs,
+) -> Tensor:
     """Quantize a tensor using a given number of bits
 
     Args:
         x (Tensor): input tensor to be quantized
         num_bits (int): number of bits to quantize the tensor
+        quantization_algorithm (QuantizationAlgorithm): quantization algorithm to use
+        per_channel (bool): whether to quantize per channel (for 2D tensors) or per tensor
 
     Returns:
-        Tensor: dequantized (reconstructed) tensor
-        list[float]: history of quantization range values
-        list[float]: history of reconstruction error values
+        Tensor: quantized tensor
     """
 
     ## Switch between different quantization algorithms
     if quantization_algorithm == "EasyQuant":
         try:
             config = EasyQuantConfig(**kwargs)
-            return quantize_tensor_easy_quant(x, num_bits, config, verbose)
+            quantized_x, _, _ = quantize_tensor_easy_quant(x, num_bits, config, verbose)
+            return quantized_x
         except TypeError:
             raise ValueError(
                 f"Invalid configuration parameters for the EasyQuant algorithm: {kwargs}"
