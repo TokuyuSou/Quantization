@@ -52,23 +52,23 @@ class EasyQuant(QuantizationMethod[EasyQuantConfig, EasyQuantReconstructionSetti
         """
 
         # Optimize the quantization range using gradient descent and Adam optimizer
-        if self.verbose:
-            print(f"Optimizing quantization range using EasyQuant algorithm")
-            print(f"Learning rate: {self.learning_rate}")
-            print(f"Number of epochs: {self.num_epochs}")
+        # if self.verbose:
+        #     print(f"Optimizing quantization range using EasyQuant algorithm")
+        #     print(f"Learning rate: {self.learning_rate}")
+        #     print(f"Number of epochs: {self.num_epochs}")
 
         data = data.detach()
 
         # Initialize the quantization range to cover the entire range of the input tensor
         q_range = (
-            (torch.max(torch.abs(data)) / (2 ** (self.num_bits - 1)))
+            (torch.max(torch.abs(data)) / (2 ** (self.num_bits - 1) - 1))
             .clone()
             .detach()
             .requires_grad_(True)
         )
 
-        if self.verbose:
-            print(f"Initial quantization range: {q_range.item()}")
+        # if self.verbose:
+        #     print(f"Initial quantization range: {q_range.item()}")
 
         # track quantization range and reconstruction error
         q_range_history_tensor = torch.empty(self.num_epochs, device=data.device)
@@ -101,10 +101,10 @@ class EasyQuant(QuantizationMethod[EasyQuantConfig, EasyQuantReconstructionSetti
             # Compute the gradient of the quantization error
             optimizer.step()
 
-            if self.verbose:
-                print(
-                    f"Epoch {epoch + 1}: Quantization range = {q_range.item()}, Reconstruction error = {reconstruction_error}"
-                )
+            # if self.verbose:
+            #     print(
+            #         f"Epoch {epoch + 1}: Quantization range = {q_range.item()}, Reconstruction error = {reconstruction_error}"
+            #     )
 
             # Ensure q_range remains positive to avoid division by zero
             with torch.no_grad():
